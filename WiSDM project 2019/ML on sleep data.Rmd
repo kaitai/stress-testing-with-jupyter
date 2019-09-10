@@ -1,0 +1,138 @@
+---
+title: "Machine learning on sleep questionnaire data"
+author: "Kaisa Taipale"
+date: "July 30, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## What is this document?
+
+Here I'm doing some machine learning on data provided by Sunny.
+I'm loading the datasets, combining them, dropping non-numeric variables and some other variables, and then making a 70-30 train test split. Then I'm going to do clustering on symptoms and then some topological visualization of the data.
+
+```{r libraries used}
+library(ggplot2)
+library(tidyverse)
+library(GGally)
+library(randomForest)
+library(calibrate)
+library("cluster")
+library(factoextra)
+```
+
+```{r load the data}
+survey_train <- read.csv("~/Documents/DataViz/WiSDM project 2019/survey_train.csv")
+survey_test <- read.csv("~/Documents/DataViz/WiSDM project 2019/survey_test.csv")
+```
+Drop columns that indicate whether respondent completed the survey.
+
+```{r drop completeness scores}
+survey_test <- survey_test[,c(-61, -81, -151)]
+```
+
+Glue the two datasets together.
+
+```{r bind together to one file for exploration}
+survey_all <- rbind(survey_test, survey_train)
+```
+
+Drop any column with more than 10 percent missing (more than 13 NAs), and drop any row with more than 50 missing responses. This has the effect of dropping all the child surveys, frankly, as about 42 people did not complete the survey.
+
+```{r drop high missing}
+survey_all <- survey_all[, colMeans(is.na(survey_all)) <= .1] 
+survey_all <- survey_all[rowSums(is.na(survey_all)) <= 50, ]
+dim(survey_all)
+```
+## Factors 
+
+Create a column from the record_id that is binary and identifies each patient as having the problem (CF records) or not having the problem (Control records). Then I'll drop all the columns that are characters etc, retaining only columns that are numeric. Last, in this part, I'll graph control against patient for numeric responses. 
+
+
+To create the patient-or-control column, I'm going to be lazy and simply extract the first two characters of the record_id column and make that my factor!
+```{r create patient or control column}
+survey_all$patient <- factor(substr(survey_all$record_id, start = 1, stop = 2))
+```
+
+Now let's create a dataframe that consists only of numeric columns. We will also drop height, age, weight, and bmi: there are so many missing values that they're essentially useless. 
+
+Moreover, I'm going to drop gender, person_completing_form, osa_overall, and psq_total_yes. In previous work gender has not proved to be significant, and indeed a visual inspection indicates there's not a lot of difference. The same is true for sex, another column!
+
+Person_completing_form is not a clinical presentation, and osa_overall and psq_total_yes are summary variables -- I don't like including summary variables in SVD exploration because they inevitably show up as more important than all their components. 
+
+
+```{r numbers only}
+nums <- unlist(lapply(survey_all, is.numeric)) 
+numbers_only <- survey_all[ , nums]
+numbers_only <- numbers_only[, -which(names(numbers_only) %in% c("age","weight","height","bmi", "gender","sex", "person_completing_form", "psq_total_yes","osa_overall"))]
+```
+
+This numeric-only dataframe will be helpful when we carry out SVD. We'll glue back on the factors corresponding to patient or control to color accordingly; we can also use that right now in constructing ggplot histograms. 
+
+```{r numbers only with factor}
+numbers_and_status <- numbers_only 
+numbers_and_status$patient <- survey_all$patient
+numbers_and_status$record_id <- survey_all$record_id
+```
+
+Now I'll write this as a csv file and switch to Python.....
+
+```{r write csv file with numbers_only and status}
+write.csv(numbers_and_status, file = "numeric_sleep_questionnaire_data.csv")
+```
+
+# Some data management
+## Train-test split
+
+We need to split to have similar numbers of control and patient in both train and test. I will split respondents into patients and control and do a randomized 70-30 split on each, then combine them.
+
+```{r split respondents into patients and control}
+patients_all <- subset(numbers_and_status, patient=="CF")
+controls_all <- subset(numbers_and_status, patient=="Co")
+```
+
+Randomize each, then split:
+```{r shuffle each dataframe}
+random_patients_all <- patients_all[sample(nrow(patients_all)),]
+random_controls_all <- controls_all[sample(nrow(controls_all)),]
+```
+There are 65 patients and 67 control, so I'll just use the same split size for each.
+```{r split 70-30}
+split_size <- floor(0.7*nrow(random_patients_all))
+patients_train <- random_patients_all[1:split_size,]
+controls_train <- random_controls_all[1:split_size,]
+patients_test <- random_patients_all[(split_size+1):nrow(random_patients_all),]
+controls_test <- random_controls_all[(split_size+1):nrow(random_controls_all),]
+```
+
+```{r recombine training and testing sets}
+X_train <- rbind(controls_train,patients_train)
+y_train <- X_train$patient
+X_train <- subset(X_train, select = -c(patient))
+X_test <- rbind(controls_test,patients_test)
+y_test <- X_test$patient
+X_test <- subset(X_test, select = -c(patient))
+```
+## Imputation of missing values on training set only
+
+Here I'm using Sunny's code again and just using random forest for imputation of missing values.
+
+
+```{r impute missing values}
+X_train_imputed <- rfImpute(X_train, y_train, iter=5, ntree=300)
+y_train_imputed <- X_train_imputed$y_train
+X_train_imputed <- subset(X_train_imputed, select = -c(y_train))
+```
+
+
+Ok. Now that we've got an imputed-values training set, time to do some machine learning!
+
+## Some machine learning
+
+First I'm going to do some clustering. I am essentially going to choose my algorithms according to personal familiarity rather than any more sophisticated method. K-neearest-neighbors is first!
+
+
